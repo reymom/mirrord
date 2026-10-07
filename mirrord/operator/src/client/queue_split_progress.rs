@@ -93,11 +93,11 @@ impl<'a, P: Progress> QueueSplitProgress<'a, P> {
             }
         };
 
-        let Some(message) = splits
-            .iter()
-            .find(|split| split.spec.session.eq_ignore_ascii_case(&self.session))
-            .and_then(waiting_message)
-        else {
+        let Some(message) = waiting_message(
+            splits
+                .iter()
+                .filter(|split| split.spec.session.eq_ignore_ascii_case(&self.session)),
+        ) else {
             return;
         };
 
@@ -127,16 +127,15 @@ impl<'a, P: Progress> QueueSplitProgress<'a, P> {
     }
 }
 
-/// Describes the target pods `split` waits on, while it waits on any.
-fn waiting_message(split: &QueueSplit) -> Option<String> {
-    let status = split
-        .status
-        .as_ref()
-        .filter(|status| status.phase == "Pending")?;
-
-    let pods = status
-        .target_pods
-        .iter()
+/// Describes the target pods `splits` wait on, while they wait on any.
+///
+/// A multi-cluster session has one split per workload cluster.
+fn waiting_message<'a>(splits: impl IntoIterator<Item = &'a QueueSplit>) -> Option<String> {
+    let pods = splits
+        .into_iter()
+        .filter_map(|split| split.status.as_ref())
+        .filter(|status| status.phase == "Pending")
+        .flat_map(|status| &status.target_pods)
         .filter(|pod| pod.ready.not())
         .map(|pod| {
             let reason = pod.reason.as_deref().unwrap_or("not ready");
@@ -210,7 +209,7 @@ mod tests {
         );
 
         assert_eq!(
-            waiting_message(&split).as_deref(),
+            waiting_message([&split]).as_deref(),
             Some(
                 "waiting for a target pod to restart with the split queues and become ready: \
                  pod `a`: container `app` is running but not ready; pod `c`: not ready"
@@ -219,14 +218,29 @@ mod tests {
     }
 
     #[test]
-    fn split_without_pending_pods_waits_on_nothing() {
-        assert_eq!(waiting_message(&split("Pending", Vec::new())), None);
+    fn splits_on_several_clusters_list_every_pending_pod() {
+        let east = split("Pending", vec![pod("a", false, Some("starting"))]);
+        let west = split("Pending", vec![pod("b", false, Some("unschedulable"))]);
+        let done = split("Ready", vec![pod("c", true, None)]);
+
         assert_eq!(
-            waiting_message(&split("Ready", vec![pod("a", false, Some("starting"))])),
+            waiting_message([&east, &west, &done]).as_deref(),
+            Some(
+                "waiting for a target pod to restart with the split queues and become ready: \
+                 pod `a`: starting; pod `b`: unschedulable"
+            )
+        );
+    }
+
+    #[test]
+    fn split_without_pending_pods_waits_on_nothing() {
+        assert_eq!(waiting_message([&split("Pending", Vec::new())]), None);
+        assert_eq!(
+            waiting_message([&split("Ready", vec![pod("a", false, Some("starting"))])]),
             None
         );
         assert_eq!(
-            waiting_message(&split("Failed", vec![pod("a", false, Some("starting"))])),
+            waiting_message([&split("Failed", vec![pod("a", false, Some("starting"))])]),
             None
         );
     }

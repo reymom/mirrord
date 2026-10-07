@@ -2041,7 +2041,9 @@ impl OperatorApi<PreparedClientCert> {
             .await?;
 
         let mut connection_subtask = progress.subtask("connecting to the target");
-        let conn = self.connect_to_session(&session).await?;
+        let conn = self
+            .connect_reporting_split(&session, layer_config, &connection_subtask)
+            .await?;
         connection_subtask.success(Some("connected to the target"));
 
         Ok(OperatorSessionConnection {
