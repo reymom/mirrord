@@ -75,9 +75,14 @@ impl<'a, P: Progress> QueueSplitProgress<'a, P> {
             return;
         }
 
-        let splits = match self.api.list(&ListParams::default()).await {
-            Ok(splits) => splits.items,
-            Err(kube::Error::Api(status)) if matches!(status.code, 403 | 404) => {
+        let splits = match tokio::time::timeout(
+            POLL_INTERVAL,
+            self.api.list(&ListParams::default()),
+        )
+        .await
+        {
+            Ok(Ok(splits)) => splits.items,
+            Ok(Err(kube::Error::Api(status))) if matches!(status.code, 403 | 404) => {
                 tracing::debug!(
                     ?status,
                     "Queue split view unavailable, not reporting the split"
@@ -86,19 +91,34 @@ impl<'a, P: Progress> QueueSplitProgress<'a, P> {
 
                 return;
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 tracing::debug!(%error, "Failed to read the queue split view");
+
+                return;
+            }
+            Err(_elapsed) => {
+                tracing::debug!("Timed out reading the queue split view");
 
                 return;
             }
         };
 
-        let Some(message) = waiting_message(
+        let message = match SplitWait::of(
             splits
                 .iter()
                 .filter(|split| split.spec.session.eq_ignore_ascii_case(&self.session)),
-        ) else {
-            return;
+        ) {
+            SplitWait::Pods(message) => message,
+            SplitWait::Done => {
+                if let Some(mut task) = self.task.take() {
+                    task.success(None);
+                }
+                self.message = None;
+                self.waiting_since = None;
+
+                return;
+            }
+            SplitWait::Unknown => return,
         };
 
         if self.message.as_ref() != Some(&message) {
@@ -127,34 +147,53 @@ impl<'a, P: Progress> QueueSplitProgress<'a, P> {
     }
 }
 
-/// Describes the target pods `splits` wait on, while they wait on any.
-///
-/// A multi-cluster session has one split per workload cluster.
-fn waiting_message<'a>(splits: impl IntoIterator<Item = &'a QueueSplit>) -> Option<String> {
-    let pods = splits
-        .into_iter()
-        .filter_map(|split| split.status.as_ref())
-        .filter(|status| status.phase == "Pending")
-        .flat_map(|status| &status.target_pods)
-        .filter(|pod| pod.ready.not())
-        .map(|pod| {
-            let reason = pod.reason.as_deref().unwrap_or("not ready");
+/// What the splits of one session wait on.
+#[derive(Debug, PartialEq, Eq)]
+enum SplitWait {
+    /// Target pods that are not ready, described.
+    Pods(String),
+    /// Nothing: the splits are not waiting on target pods.
+    Done,
+    /// No split yet, or one failed.
+    Unknown,
+}
 
-            format!("pod `{}`: {reason}", pod.name)
-        })
-        .collect::<Vec<_>>();
+impl SplitWait {
+    /// Reads what `splits` wait on. A multi-cluster session has one split per workload cluster.
+    fn of<'a>(splits: impl IntoIterator<Item = &'a QueueSplit>) -> Self {
+        let statuses = splits
+            .into_iter()
+            .filter_map(|split| split.status.as_ref())
+            .collect::<Vec<_>>();
+        if statuses.is_empty() || statuses.iter().any(|status| status.phase == "Failed") {
+            return Self::Unknown;
+        }
 
-    pods.is_empty().not().then(|| {
-        format!(
+        let pods = statuses
+            .iter()
+            .filter(|status| status.phase == "Pending")
+            .flat_map(|status| &status.target_pods)
+            .filter(|pod| pod.ready.not())
+            .map(|pod| {
+                let reason = pod.reason.as_deref().unwrap_or("not ready");
+
+                format!("pod `{}`: {reason}", pod.name)
+            })
+            .collect::<Vec<_>>();
+        if pods.is_empty() {
+            return Self::Done;
+        }
+
+        Self::Pods(format!(
             "waiting for a target pod to restart with the split queues and become ready: {}",
             pods.join("; ")
-        )
-    })
+        ))
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::waiting_message;
+    use super::SplitWait;
     use crate::crd::{
         queue_split::{QueueSplit, QueueSplitSpec, QueueSplitStatus, QueueSplitTargetPod},
         session::{KubeResourceTarget, SessionOwner, SessionTarget},
@@ -209,10 +248,11 @@ mod tests {
         );
 
         assert_eq!(
-            waiting_message([&split]).as_deref(),
-            Some(
+            SplitWait::of([&split]),
+            SplitWait::Pods(
                 "waiting for a target pod to restart with the split queues and become ready: \
                  pod `a`: container `app` is running but not ready; pod `c`: not ready"
+                    .to_owned()
             )
         );
     }
@@ -224,24 +264,36 @@ mod tests {
         let done = split("Ready", vec![pod("c", true, None)]);
 
         assert_eq!(
-            waiting_message([&east, &west, &done]).as_deref(),
-            Some(
+            SplitWait::of([&east, &west, &done]),
+            SplitWait::Pods(
                 "waiting for a target pod to restart with the split queues and become ready: \
                  pod `a`: starting; pod `b`: unschedulable"
+                    .to_owned()
             )
         );
     }
 
     #[test]
     fn split_without_pending_pods_waits_on_nothing() {
-        assert_eq!(waiting_message([&split("Pending", Vec::new())]), None);
         assert_eq!(
-            waiting_message([&split("Ready", vec![pod("a", false, Some("starting"))])]),
-            None
+            SplitWait::of([&split("Pending", Vec::new())]),
+            SplitWait::Done
         );
         assert_eq!(
-            waiting_message([&split("Failed", vec![pod("a", false, Some("starting"))])]),
-            None
+            SplitWait::of([&split("Ready", vec![pod("a", false, Some("starting"))])]),
+            SplitWait::Done
+        );
+    }
+
+    #[test]
+    fn missing_or_failed_split_is_unknown() {
+        assert_eq!(SplitWait::of([]), SplitWait::Unknown);
+        assert_eq!(
+            SplitWait::of([
+                &split("Pending", vec![pod("a", false, Some("starting"))]),
+                &split("Failed", Vec::new()),
+            ]),
+            SplitWait::Unknown
         );
     }
 }

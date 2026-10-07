@@ -2677,9 +2677,12 @@ impl OperatorApi<PreparedClientCert> {
                 }
             }
 
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            if let Some(split_progress) = &mut split_progress {
-                split_progress.poll().await;
+            let wait = tokio::time::sleep(Duration::from_secs(5));
+            match &mut split_progress {
+                Some(split_progress) => {
+                    tokio::join!(wait, split_progress.poll());
+                }
+                None => wait.await,
             }
             copied = api
                 .get(&name)
