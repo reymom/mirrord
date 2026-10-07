@@ -898,10 +898,15 @@ fn details_lines(split: &QueueSplit) -> Vec<Line<'static>> {
             (false, false) => ("not patched, not ready", Style::default().fg(theme::AMBER)),
         };
 
-        lines.push(Line::from_iter([
+        let mut line = Line::from_iter([
             Span::raw(format!("  {:<width$} ", pod.name, width = LABEL_WIDTH - 2)),
             Span::styled(state, style),
-        ]));
+        ]);
+        if let Some(reason) = &pod.reason {
+            line.push_span(Span::styled(format!(": {reason}"), theme::muted()));
+        }
+
+        lines.push(line);
     }
 
     lines
